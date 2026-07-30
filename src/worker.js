@@ -69,6 +69,13 @@ export default {
           return new Response('OK');
         }
 
+        if (text === '/fast') {
+          await sendChatAction(env, chatId, 'typing');
+          const result = await autoSelectFastest(env, chatId);
+          await sendMessage(env, chatId, result);
+          return new Response('OK');
+        }
+
         if (text.startsWith('/')) return new Response('OK');
 
         const model = await getModel(env, chatId);
@@ -119,6 +126,73 @@ const MODELS = [
 async function getModel(env, chatId) {
   const tag = await env.KV.get(`model:${chatId}`) || 'l8';
   return MODELS.find(m => m.tag === tag) || MODELS[0];
+}
+
+// 自动测速选最快模型
+async function autoSelectFastest(env, chatId) {
+  // 检查缓存（1小时内有效）
+  const cached = await env.KV.get('speed:fastest', { type: 'json' });
+  if (cached && cached.tag && (Date.now() - cached.ts < 3600000)) {
+    await env.KV.put(`model:${chatId}`, cached.tag);
+    return '🚀 已自动切换到最快模型: ' + cached.name + '\n响应: ' + cached.ms + 'ms\n\n缓存有效中（1小时内不重测），下次 /fast 可重新测速';
+  }
+
+  // 并行测速所有模型
+  var results = [];
+  var tests = MODELS.map(function(m) {
+    return (async function() {
+      var start = Date.now();
+      try {
+        var controller = new AbortController();
+        var timeout = setTimeout(function() { controller.abort(); }, 8000);
+        var res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + env.NVIDIA_API_KEY,
+          },
+          body: JSON.stringify({
+            model: m.id,
+            messages: [{ role: 'user', content: 'Hi' }],
+            stream: false,
+            temperature: 0,
+            max_tokens: 5,
+          }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        var ms = Date.now() - start;
+        if (res.ok) {
+          results.push({ tag: m.tag, name: m.name, ms: ms, ok: true });
+        } else {
+          results.push({ tag: m.tag, name: m.name, ms: ms, ok: false });
+        }
+      } catch (e) {
+        results.push({ tag: m.tag, name: m.name, ms: 9999, ok: false });
+      }
+    })();
+  });
+  await Promise.all(tests);
+
+  // 按响应时间排序
+  results.sort(function(a, b) { return a.ms - b.ms; });
+
+  // 选出最快的可用模型
+  var fastest = results.find(function(r) { return r.ok; });
+  if (!fastest) return '❌ 所有模型当前不可用，请稍后再试';
+
+  // 缓存并设置
+  await env.KV.put('speed:fastest', JSON.stringify({ tag: fastest.tag, name: fastest.name, ms: fastest.ms, ts: Date.now() }));
+  await env.KV.put(`model:${chatId}`, fastest.tag);
+
+  // 生成报告
+  var report = '🚀 模型测速完成，已切换到最快: ' + fastest.name + ' (' + fastest.ms + 'ms)\n\n';
+  report += '📊 测速排名:\n';
+  results.forEach(function(r, i) {
+    var icon = r.ok ? (r.tag === fastest.tag ? '🥇' : '  ') : '❌';
+    report += icon + ' ' + r.name + ': ' + (r.ok ? r.ms + 'ms' : '失败') + '\n';
+  });
+  return report;
 }
 
 async function showModelMenu(env, chatId) {

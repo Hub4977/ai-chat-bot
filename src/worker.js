@@ -166,7 +166,7 @@ async function autoSelectFastest(env, chatId) {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + env.NVIDIA_API_KEY,
+            'Authorization': 'Bearer ' + (await getNvidiaKey(env)),
           },
           body: JSON.stringify({
             model: m.id,
@@ -379,9 +379,9 @@ async function aiTranslate(env, titles) {
           return lines;
         }
       }
-      // 401/403/429 标记失效
+      // 401/403/429 记录失败（保守：只记录不立即降级）
       if (res.status === 401 || res.status === 403 || res.status === 429) {
-        await markNvidiaDown(env);
+        await recordNvidiaFail(env);
       }
     } catch (e) {
       console.error('NVIDIA translate error:', e);
@@ -626,48 +626,61 @@ async function getNvidiaKey(env) {
   return key || env.NVIDIA_API_KEY;
 }
 
-// 检查 NVIDIA 是否失效
+// 检查 NVIDIA 是否应该降级
+// 规则：连续 failCount 次认证失败(401/403/429)才降级，超时/网络错误不算
+// 降级后30分钟自动试探恢复
 async function isNvidiaDown(env) {
-  var fail = await env.KV.get('nvidia_fail');
+  var fail = await env.KV.get('nvidia_fail', { type: 'json' });
   if (!fail) return false;
-  var ts = parseInt(fail);
-  // 5 分钟内认为失效
-  return (Date.now() - ts) < 300000;
+  // 没凑够3次连续失败，不算降级
+  if (!fail.count || fail.count < 3) return false;
+  // 30分钟后自动试探恢复
+  var elapsed = Date.now() - (fail.lastFailTs || 0);
+  if (elapsed > 1800000) return false;
+  return true;
 }
 
-// 标记 NVIDIA 失效
-async function markNvidiaDown(env) {
-  await env.KV.put('nvidia_fail', String(Date.now()));
+// 记录一次认证失败（401/403/429）
+async function recordNvidiaFail(env) {
+  var fail = await env.KV.get('nvidia_fail', { type: 'json' }) || { count: 0 };
+  fail.count = (fail.count || 0) + 1;
+  fail.lastFailTs = Date.now();
+  await env.KV.put('nvidia_fail', JSON.stringify(fail));
 }
 
-// 恢复 NVIDIA
+// 恢复 NVIDIA（成功一次就清零）
 async function markNvidiaUp(env) {
   await env.KV.delete('nvidia_fail');
 }
 
-// 主调用函数：NVIDIA → Workers AI 自动降级
+// 主调用函数：NVIDIA → Workers AI 保守降级
 async function callAI(env, modelId, messages) {
   var allMessages = [{ role: 'system', content: '你是一个有用的AI助手。请用中文回复。' }];
   for (var i = 0; i < messages.length; i++) allMessages.push(messages[i]);
 
-  // NVIDIA 还没失效，优先用
+  // NVIDIA 还没降级，优先用
   if (!(await isNvidiaDown(env))) {
     var nvidiaResult = await callNvidiaRaw(env, modelId, allMessages);
     if (nvidiaResult.ok) {
       return nvidiaResult.text;
     }
-    // 401/403/429 说明 key 失效或配额用完
+    // 只有认证失败才计入降级计数，超时/网络错误不计入
     if (nvidiaResult.status === 401 || nvidiaResult.status === 403 || nvidiaResult.status === 429) {
-      await markNvidiaDown(env);
-      // 自动降级到 Workers AI
-      var fallbackResult = await callWorkersAI(env, allMessages);
-      if (fallbackResult) return fallbackResult + '\n\n⚠️ NVIDIA API 已失效，已自动切换到备用 AI';
-      return '❌ NVIDIA API 失效且备用 AI 不可用，请用 /key 更新密钥';
+      await recordNvidiaFail(env);
+      // 检查是否已达到降级阈值
+      if (await isNvidiaDown(env)) {
+        // 连续失败达标，降级到 Workers AI
+        var fallbackResult = await callWorkersAI(env, allMessages);
+        if (fallbackResult) return fallbackResult + '\n\n⚠️ NVIDIA API 连续失败，已自动切换备用 AI\n用 /key 更新密钥可恢复';
+        return '❌ NVIDIA API 失效且备用 AI 不可用，请用 /key 更新密钥';
+      }
+      // 还没达3次，只记录不降级，返回原始错误
+      return nvidiaResult.text;
     }
     return nvidiaResult.text;
   }
 
-  // NVIDIA 已标记失效，直接走 Workers AI
+  // NVIDIA 已降级，走 Workers AI
   var result = await callWorkersAI(env, allMessages);
   if (result) return result;
   return '❌ 所有 AI 通道不可用，请用 /key 更新 NVIDIA 密钥';

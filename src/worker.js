@@ -2,8 +2,8 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // ── Web 页面 ──
-    if (url.pathname === '/' || url.pathname === '/index.html') {
+    // ── Web 页面（仅 GET）──
+    if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
       const html = await env.KV.get('web:html');
       return new Response(html || 'Web page not found', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
@@ -126,9 +126,12 @@ export default {
       return new Response('OK');
     }
 
-    // 其他请求返回首页
-    const fallbackHtml = await env.KV.get('web:html');
-    return new Response(fallbackHtml || 'Not found', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    // 其他 GET 请求返回首页
+    if (request.method === 'GET') {
+      const fallbackHtml = await env.KV.get('web:html');
+      return new Response(fallbackHtml || 'Not found', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+    return new Response('OK');
   },
 
   // ── Cron Trigger: 每天北京时间 6:00 (UTC 22:00) ─────────────────

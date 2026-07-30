@@ -399,28 +399,80 @@ async function fetchIntlNews() {
   return titles;
 }
 
-// ── 国内新闻：36kr + GlobalTimes + CNBC ─────────────────────
+// ── 国内新闻：36kr + IT之家 + 人民网 + GlobalTimes + CNBC ──────
 async function fetchChineseNews() {
   var titles = [];
 
-  // 36kr RSS
+  // 36kr（科技商业）
   try {
     var res = await fetch('https://36kr.com/feed');
     var xml = await res.text();
     var matches = [...xml.matchAll(/<title>(?:<!\[CDATA\[)?(.+?)(?:\]\]>)?<\/title>/g)];
-    for (var i = 1; i < matches.length && titles.length < 15; i++) {
+    for (var i = 1; i < matches.length && titles.length < 20; i++) {
       var t = matches[i][1].trim();
       if (t.length > 4) titles.push(t);
     }
   } catch {}
 
-  // GlobalTimes
-  if (titles.length < 15) {
+  // IT之家（科技数码）
+  if (titles.length < 20) {
+    try {
+      var res = await fetch('https://www.ithome.com/rss/');
+      var xml = await res.text();
+      var matches = [...xml.matchAll(/<title>(?:<!\[CDATA\[)?(.+?)(?:\]\]>)?<\/title>/g)];
+      for (var i = 1; i < matches.length && titles.length < 20; i++) {
+        var t = matches[i][1].trim();
+        if (t.length > 4 && titles.indexOf(t) === -1) titles.push(t);
+      }
+    } catch {}
+  }
+
+  // 人民网-时政
+  if (titles.length < 20) {
+    try {
+      var res = await fetch('http://www.people.com.cn/rss/politics.xml');
+      var xml = await res.text();
+      var matches = [...xml.matchAll(/<title>(?:<!\[CDATA\[)?(.+?)(?:\]\]>)?<\/title>/g)];
+      for (var i = 1; i < matches.length && titles.length < 20; i++) {
+        var t = matches[i][1].trim();
+        if (t.length > 4 && titles.indexOf(t) === -1) titles.push(t);
+      }
+    } catch {}
+  }
+
+  // 人民网-国际
+  if (titles.length < 20) {
+    try {
+      var res = await fetch('http://www.people.com.cn/rss/world.xml');
+      var xml = await res.text();
+      var matches = [...xml.matchAll(/<title>(?:<!\[CDATA\[)?(.+?)(?:\]\]>)?<\/title>/g)];
+      for (var i = 1; i < matches.length && titles.length < 20; i++) {
+        var t = matches[i][1].trim();
+        if (t.length > 4 && titles.indexOf(t) === -1) titles.push(t);
+      }
+    } catch {}
+  }
+
+  // 人民网-财经
+  if (titles.length < 20) {
+    try {
+      var res = await fetch('http://www.people.com.cn/rss/finance.xml');
+      var xml = await res.text();
+      var matches = [...xml.matchAll(/<title>(?:<!\[CDATA\[)?(.+?)(?:\]\]>)?<\/title>/g)];
+      for (var i = 1; i < matches.length && titles.length < 20; i++) {
+        var t = matches[i][1].trim();
+        if (t.length > 4 && titles.indexOf(t) === -1) titles.push(t);
+      }
+    } catch {}
+  }
+
+  // GlobalTimes（环球时报）
+  if (titles.length < 20) {
     try {
       var res = await fetch('https://www.globaltimes.cn/rss/outbrain.xml');
       var xml = await res.text();
       var matches = [...xml.matchAll(/<title>(?:<!\[CDATA\[)?(.+?)(?:\]\]>)?<\/title>/g)];
-      for (var i = 1; i < matches.length && titles.length < 15; i++) {
+      for (var i = 1; i < matches.length && titles.length < 20; i++) {
         var t = matches[i][1].trim();
         if (t.length > 4 && titles.indexOf(t) === -1) titles.push(t);
       }
@@ -428,12 +480,12 @@ async function fetchChineseNews() {
   }
 
   // CNBC（财经补充）
-  if (titles.length < 15) {
+  if (titles.length < 20) {
     try {
       var res = await fetch('https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362');
       var xml = await res.text();
       var matches = [...xml.matchAll(/<title>(?:<!\[CDATA\[)?(.+?)(?:\]\]>)?<\/title>/g)];
-      for (var i = 1; i < matches.length && titles.length < 15; i++) {
+      for (var i = 1; i < matches.length && titles.length < 20; i++) {
         var t = matches[i][1].trim();
         if (t.length > 4 && titles.indexOf(t) === -1) titles.push(t);
       }

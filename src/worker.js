@@ -22,7 +22,7 @@ export default {
         if (text === '/start') {
           await env.KV.put(`sub:${chatId}`, '1'); // 自动订阅新闻
           await sendMessage(env, chatId,
-            '👋 你好！我是 AI Chat 机器人\n\n' +
+            '👋 你好！我是智能体科技\n\n' +
             '💬 直接发消息跟我对话\n' +
             '/model — 选择 AI 模型\n' +
             '/fast — 自动测速选最快模型\n' +

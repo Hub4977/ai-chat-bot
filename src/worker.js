@@ -2,18 +2,27 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (request.method !== 'POST') {
-      return new Response('AI Chat Bot is running', { headers: { 'Content-Type': 'text/plain' } });
+    // ── Web 页面 ──
+    if (url.pathname === '/' || url.pathname === '/index.html') {
+      const html = await env.KV.get('web:html');
+      return new Response(html || 'Web page not found', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    let update;
-    try { update = await request.json(); } catch { return new Response('OK'); }
+    // ── Web API ──
+    if (url.pathname.startsWith('/api/')) {
+      return handleWebAPI(url.pathname, request, env);
+    }
 
-    try {
-      if (update.callback_query) {
-        await handleCallback(env, update.callback_query);
-        return new Response('OK');
-      }
+    // ── Telegram Webhook（POST）──
+    if (request.method === 'POST') {
+      let update;
+      try { update = await request.json(); } catch { return new Response('OK'); }
+
+      try {
+        if (update.callback_query) {
+          await handleCallback(env, update.callback_query);
+          return new Response('OK');
+        }
 
       if (update.message && update.message.text) {
         const chatId = update.message.chat.id;
@@ -109,12 +118,17 @@ export default {
         await env.KV.put(historyKey, JSON.stringify(history));
 
         await sendMessage(env, chatId, reply);
+        }
+      } catch (err) {
+        console.error('Error:', err);
       }
-    } catch (err) {
-      console.error('Error:', err);
+
+      return new Response('OK');
     }
 
-    return new Response('OK');
+    // 其他请求返回首页
+    const fallbackHtml = await env.KV.get('web:html');
+    return new Response(fallbackHtml || 'Not found', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   },
 
   // ── Cron Trigger: 每天北京时间 6:00 (UTC 22:00) ─────────────────
@@ -768,3 +782,104 @@ async function sendChatAction(env, chatId, action) {
     }
   );
 }
+
+// ── Web API ────────────────────────────────────────────────────
+async function handleWebAPI(pathname, request, env) {
+  var headers = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+  };
+
+  // /api/chat — 聊天
+  if (pathname === '/api/chat') {
+    try {
+      var body = await request.json();
+      var messages = body.messages || [];
+      var tag = body.model || 'l8';
+      var model = MODELS.find(function(m) { return m.tag === tag; }) || MODELS[0];
+      var allMessages = [{ role: 'system', content: '你是一个有用的AI助手。请用中文回复。' }];
+      for (var i = 0; i < messages.length; i++) allMessages.push(messages[i]);
+      var result = await callAI(env, model.id, messages);
+      return new Response(JSON.stringify({ ok: true, text: result }), { headers: headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ ok: false, error: e.message }), { headers: headers });
+    }
+  }
+
+  // /api/news — 新闻
+  if (pathname === '/api/news') {
+    try {
+      var text = await fetchNews(env);
+      return new Response(JSON.stringify({ ok: true, text: text }), { headers: headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ ok: false, error: e.message }), { headers: headers });
+    }
+  }
+
+  // /api/model — 切换模型
+  if (pathname === '/api/model') {
+    try {
+      var body = await request.json();
+      var tag = body.tag || 'l8';
+      var model = MODELS.find(function(m) { return m.tag === tag; }) || MODELS[0];
+      return new Response(JSON.stringify({ ok: true, name: model.name }), { headers: headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ ok: false, error: e.message }), { headers: headers });
+    }
+  }
+
+  // /api/fast — 测速
+  if (pathname === '/api/fast') {
+    try {
+      var result = await autoSelectFastestWeb(env);
+      return new Response(JSON.stringify({ ok: true, text: result }), { headers: headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ ok: false, error: e.message }), { headers: headers });
+    }
+  }
+
+  return new Response(JSON.stringify({ ok: false, error: 'unknown api' }), { headers: headers });
+}
+
+// Web版测速（不需要chatId）
+async function autoSelectFastestWeb(env) {
+  var cached = await env.KV.get('speed:fastest', { type: 'json' });
+  if (cached && cached.tag && (Date.now() - cached.ts < 3600000)) {
+    return '已选择最快模型: ' + cached.name + ' (' + cached.ms + 'ms)\n缓存有效中（1小时内不重测）';
+  }
+  var results = [];
+  var tests = MODELS.map(function(m) {
+    return (async function() {
+      var start = Date.now();
+      try {
+        var controller = new AbortController();
+        var timeout = setTimeout(function() { controller.abort(); }, 8000);
+        var key = await getNvidiaKey(env);
+        var res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+          body: JSON.stringify({ model: m.id, messages: [{ role: 'user', content: 'Hi' }], stream: false, temperature: 0, max_tokens: 5 }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        var ms = Date.now() - start;
+        results.push({ tag: m.tag, name: m.name, ms: ms, ok: res.ok });
+      } catch (e) {
+        results.push({ tag: m.tag, name: m.name, ms: 9999, ok: false });
+      }
+    })();
+  });
+  await Promise.all(tests);
+  results.sort(function(a, b) { return a.ms - b.ms; });
+  var fastest = results.find(function(r) { return r.ok; });
+  if (!fastest) return '所有模型当前不可用';
+  await env.KV.put('speed:fastest', JSON.stringify({ tag: fastest.tag, name: fastest.name, ms: fastest.ms, ts: Date.now() }));
+  var report = '测速完成，最快: ' + fastest.name + ' (' + fastest.ms + 'ms)\n\n排名:\n';
+  results.forEach(function(r, i) {
+    var icon = r.ok ? (r.tag === fastest.tag ? '🥇' : '  ') : '❌';
+    report += icon + ' ' + r.name + ': ' + (r.ok ? r.ms + 'ms' : '失败') + '\n';
+  });
+  return report;
+}
+
+

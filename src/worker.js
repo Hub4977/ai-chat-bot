@@ -675,7 +675,8 @@ async function markNvidiaUp(env) {
 async function callAI(env, modelId, messages) {
   var bjNow = new Date(Date.now() + 8 * 3600000);
   var bjTime = bjNow.getUTCFullYear() + '-' + String(bjNow.getUTCMonth()+1).padStart(2,'0') + '-' + String(bjNow.getUTCDate()).padStart(2,'0') + ' ' + String(bjNow.getUTCHours()).padStart(2,'0') + ':' + String(bjNow.getUTCMinutes()).padStart(2,'0');
-  var allMessages = [{ role: 'system', content: '你是一个有用的AI助手。请用中文回复。当前北京时间：' + bjTime + '。' }];
+  var sysPrompt = '你是一个有用的AI助手。请用中文回复。重要规则：1.当前北京时间是' + bjTime + '，你必须以这个时间为当前真实时间来回答任何时间相关问题，不要说你不知道当前时间。2.当用户问及新闻、事件、资讯时，请基于你已知的最新的信息回答，并说明信息的时间范围。3.不要提及你的知识截止日期或训练数据限制，直接以当前时间视角回答。';
+  var allMessages = [{ role: 'system', content: sysPrompt }];
   for (var i = 0; i < messages.length; i++) allMessages.push(messages[i]);
 
   // NVIDIA 还没降级，优先用

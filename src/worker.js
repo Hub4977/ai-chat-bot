@@ -324,7 +324,8 @@ const QUOTES = [
 ];
 
 async function fetchNews(env) {
-  const now = new Date();
+  // 北京时间 (UTC+8)
+  const now = new Date(Date.now() + 8 * 3600000);
   const dateStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}-${String(now.getUTCDate()).padStart(2,'0')}`;
 
   // 并行抓取国际新闻（多源）+ 国内新闻
@@ -672,7 +673,9 @@ async function markNvidiaUp(env) {
 
 // 主调用函数：NVIDIA → Workers AI 保守降级
 async function callAI(env, modelId, messages) {
-  var allMessages = [{ role: 'system', content: '你是一个有用的AI助手。请用中文回复。' }];
+  var bjNow = new Date(Date.now() + 8 * 3600000);
+  var bjTime = bjNow.getUTCFullYear() + '-' + String(bjNow.getUTCMonth()+1).padStart(2,'0') + '-' + String(bjNow.getUTCDate()).padStart(2,'0') + ' ' + String(bjNow.getUTCHours()).padStart(2,'0') + ':' + String(bjNow.getUTCMinutes()).padStart(2,'0');
+  var allMessages = [{ role: 'system', content: '你是一个有用的AI助手。请用中文回复。当前北京时间：' + bjTime + '。' }];
   for (var i = 0; i < messages.length; i++) allMessages.push(messages[i]);
 
   // NVIDIA 还没降级，优先用
@@ -800,8 +803,6 @@ async function handleWebAPI(pathname, request, env) {
       var messages = body.messages || [];
       var tag = body.model || 'l8';
       var model = MODELS.find(function(m) { return m.tag === tag; }) || MODELS[0];
-      var allMessages = [{ role: 'system', content: '你是一个有用的AI助手。请用中文回复。' }];
-      for (var i = 0; i < messages.length; i++) allMessages.push(messages[i]);
       var result = await callAI(env, model.id, messages);
       return new Response(JSON.stringify({ ok: true, text: result }), { headers: headers });
     } catch (e) {

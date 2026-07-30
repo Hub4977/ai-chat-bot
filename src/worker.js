@@ -25,10 +25,13 @@ export default {
             '👋 你好！我是 AI Chat 机器人\n\n' +
             '💬 直接发消息跟我对话\n' +
             '/model — 选择 AI 模型\n' +
+            '/fast — 自动测速选最快模型\n' +
             '/news — 获取今日新闻\n' +
+            '/key — 更新 AI 密钥\n' +
             '/clear — 清空对话历史\n' +
             '/help — 帮助\n\n' +
-            '📰 每天北京时间 6:00 自动推送新闻');
+            '📰 每天 6:00 自动推送新闻\n' +
+            '🔄 API失效自动切换备用AI');
           return new Response('OK');
         }
 
@@ -38,10 +41,12 @@ export default {
             '🤖 AI Chat Bot\n\n' +
             '💬 直接发消息即可对话\n' +
             '/model — 选择 AI 模型\n' +
+            '/fast — 自动测速选最快\n' +
             '/news — 获取今日新闻\n' +
+            '/key nvapi-xxx — 更新密钥\n' +
             '/clear — 清空历史\n' +
-            `/current — 当前模型\n\n` +
-            `当前: ${model.name}`);
+            '/current — 当前模型\n\n' +
+            '当前: ' + model.name);
           return new Response('OK');
         }
 
@@ -76,6 +81,18 @@ export default {
           return new Response('OK');
         }
 
+        if (text.startsWith('/key ')) {
+          const newKey = text.substring(5).trim();
+          if (newKey.startsWith('nvapi-')) {
+            await env.KV.put('nvidia_key', newKey);
+            await env.KV.delete('nvidia_fail');
+            await sendMessage(env, chatId, '✅ NVIDIA API Key 已更新，已恢复正常通道');
+          } else {
+            await sendMessage(env, chatId, '❌ 无效的 Key 格式，应以 nvapi- 开头');
+          }
+          return new Response('OK');
+        }
+
         if (text.startsWith('/')) return new Response('OK');
 
         const model = await getModel(env, chatId);
@@ -85,7 +102,7 @@ export default {
 
         await sendChatAction(env, chatId, 'typing');
 
-        const reply = await callNvidia(env, model.id, history);
+        const reply = await callAI(env, model.id, history);
         history.push({ role: 'assistant', content: reply });
 
         if (history.length > 20) history = history.slice(-20);
@@ -316,7 +333,7 @@ async function fetchNews(env) {
   return text;
 }
 
-// AI 批量翻译：把标题列表一次性交给 Llama 3.1 8B 翻译
+// AI 批量翻译：NVIDIA → Workers AI → MyMemory 三级降级
 async function aiTranslate(env, titles) {
   if (!titles || titles.length === 0) return ['暂无数据'];
   var numbered = '';
@@ -324,43 +341,75 @@ async function aiTranslate(env, titles) {
     numbered += (i+1) + '. ' + titles[i] + '\n';
   }
   var prompt = '将以下新闻标题翻译为简体中文，只输出翻译结果，每行一条，保留编号前缀，不要加任何其他内容：\n\n' + numbered;
+  var sysMsg = '你是一个翻译器。只输出简体中文翻译结果，不加任何解释。';
 
-  try {
-    var controller = new AbortController();
-    var timeout = setTimeout(function() { controller.abort(); }, 15000);
-    var res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + env.NVIDIA_API_KEY,
-      },
-      body: JSON.stringify({
-        model: 'meta/llama-3.1-8b-instruct',
-        messages: [
-          { role: 'system', content: '你是一个翻译器。只输出简体中文翻译结果，不加任何解释。' },
-          { role: 'user', content: prompt }
-        ],
-        stream: false,
-        temperature: 0.0,
-        max_tokens: 600,
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (res.ok) {
-      var data = await res.json();
-      var content = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
-      // 去掉 AI 输出中的编号前缀（如 "1. " "1. "），代码会自己加
-      var lines = content.split('\n').map(function(l) {
-        return l.replace(/^\d+[\.\s]+/, '').trim();
-      }).filter(function(l) { return l.length > 2; });
-      if (lines.length >= 5) return lines;
+  // 第1级：NVIDIA API（如果没失效）
+  if (!(await isNvidiaDown(env))) {
+    try {
+      var controller = new AbortController();
+      var timeout = setTimeout(function() { controller.abort(); }, 15000);
+      var key = await getNvidiaKey(env);
+      var res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + key,
+        },
+        body: JSON.stringify({
+          model: 'meta/llama-3.1-8b-instruct',
+          messages: [
+            { role: 'system', content: sysMsg },
+            { role: 'user', content: prompt }
+          ],
+          stream: false,
+          temperature: 0.0,
+          max_tokens: 600,
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (res.ok) {
+        var data = await res.json();
+        var content = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+        var lines = content.split('\n').map(function(l) {
+          return l.replace(/^\d+[\.\s]+/, '').trim();
+        }).filter(function(l) { return l.length > 2; });
+        if (lines.length >= 5) {
+          await markNvidiaUp(env);
+          return lines;
+        }
+      }
+      // 401/403/429 标记失效
+      if (res.status === 401 || res.status === 403 || res.status === 429) {
+        await markNvidiaDown(env);
+      }
+    } catch (e) {
+      console.error('NVIDIA translate error:', e);
     }
-  } catch (e) {
-    console.error('AI translate error:', e);
   }
 
-  // AI 翻译失败，用 MyMemory 逐条翻译兜底
+  // 第2级：Cloudflare Workers AI 兜底
+  try {
+    if (env.AI) {
+      var aiInput = {
+        messages: [
+          { role: 'system', content: sysMsg },
+          { role: 'user', content: prompt }
+        ]
+      };
+      var aiRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', aiInput);
+      if (aiRes && aiRes.response) {
+        var lines = aiRes.response.split('\n').map(function(l) {
+          return l.replace(/^\d+[\.\s]+/, '').trim();
+        }).filter(function(l) { return l.length > 2; });
+        if (lines.length >= 5) return lines;
+      }
+    }
+  } catch (e) {
+    console.error('Workers AI translate error:', e);
+  }
+
+  // 第3级：MyMemory 逐条翻译兜底
   var fallback = [];
   for (var i = 0; i < titles.length && fallback.length < 10; i++) {
     var t = await mymemoryTranslate(titles[i]);
@@ -570,17 +619,71 @@ async function fetchChineseNews() {
   return titles;
 }
 
-// ── Chat ────────────────────────────────────────────────────────
-async function callNvidia(env, modelId, messages) {
-  const allMessages = [{ role: 'system', content: '你是一个有用的AI助手。请用中文回复。' }, ...messages];
+// ── AI 调用（NVIDIA 主力 + Workers AI 兜底）────────────────────
+// 获取当前有效的 NVIDIA API Key
+async function getNvidiaKey(env) {
+  var key = await env.KV.get('nvidia_key');
+  return key || env.NVIDIA_API_KEY;
+}
+
+// 检查 NVIDIA 是否失效
+async function isNvidiaDown(env) {
+  var fail = await env.KV.get('nvidia_fail');
+  if (!fail) return false;
+  var ts = parseInt(fail);
+  // 5 分钟内认为失效
+  return (Date.now() - ts) < 300000;
+}
+
+// 标记 NVIDIA 失效
+async function markNvidiaDown(env) {
+  await env.KV.put('nvidia_fail', String(Date.now()));
+}
+
+// 恢复 NVIDIA
+async function markNvidiaUp(env) {
+  await env.KV.delete('nvidia_fail');
+}
+
+// 主调用函数：NVIDIA → Workers AI 自动降级
+async function callAI(env, modelId, messages) {
+  var allMessages = [{ role: 'system', content: '你是一个有用的AI助手。请用中文回复。' }];
+  for (var i = 0; i < messages.length; i++) allMessages.push(messages[i]);
+
+  // NVIDIA 还没失效，优先用
+  if (!(await isNvidiaDown(env))) {
+    var nvidiaResult = await callNvidiaRaw(env, modelId, allMessages);
+    if (nvidiaResult.ok) {
+      return nvidiaResult.text;
+    }
+    // 401/403/429 说明 key 失效或配额用完
+    if (nvidiaResult.status === 401 || nvidiaResult.status === 403 || nvidiaResult.status === 429) {
+      await markNvidiaDown(env);
+      // 自动降级到 Workers AI
+      var fallbackResult = await callWorkersAI(env, allMessages);
+      if (fallbackResult) return fallbackResult + '\n\n⚠️ NVIDIA API 已失效，已自动切换到备用 AI';
+      return '❌ NVIDIA API 失效且备用 AI 不可用，请用 /key 更新密钥';
+    }
+    return nvidiaResult.text;
+  }
+
+  // NVIDIA 已标记失效，直接走 Workers AI
+  var result = await callWorkersAI(env, allMessages);
+  if (result) return result;
+  return '❌ 所有 AI 通道不可用，请用 /key 更新 NVIDIA 密钥';
+}
+
+// NVIDIA 原始调用
+async function callNvidiaRaw(env, modelId, allMessages) {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 25000);
-    const res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+    var controller = new AbortController();
+    var timeout = setTimeout(function() { controller.abort(); }, 25000);
+    var key = await getNvidiaKey(env);
+    var res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${env.NVIDIA_API_KEY}`,
+        'Authorization': 'Bearer ' + key,
       },
       body: JSON.stringify({
         model: modelId,
@@ -593,15 +696,34 @@ async function callNvidia(env, modelId, messages) {
     });
     clearTimeout(timeout);
     if (!res.ok) {
-      return `❌ 模型暂时不可用 (${res.status})\n试试 /model 换一个`;
+      return { ok: false, status: res.status, text: '❌ 模型暂时不可用 (' + res.status + ')\n试试 /model 换一个' };
     }
-    const data = await res.json();
-    return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '未收到回复';
+    var data = await res.json();
+    var content = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '未收到回复';
+    // 调用成功，清除失效标记
+    await markNvidiaUp(env);
+    return { ok: true, text: content };
   } catch (err) {
     if (err.name === 'AbortError') {
-      return '⏱ 模型响应超时，请重试或 /model 换一个更快的模型';
+      return { ok: false, status: 0, text: '⏱ 模型响应超时，请重试或 /model 换一个更快的模型' };
     }
-    return `❌ 请求失败: ${err.message}`;
+    return { ok: false, status: 0, text: '❌ 请求失败: ' + err.message };
+  }
+}
+
+// Cloudflare Workers AI 兜底（免费，永不过期）
+async function callWorkersAI(env, messages) {
+  try {
+    if (!env.AI) return null;
+    var input = { messages: messages };
+    var response = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', input);
+    if (response && response.response) {
+      return response.response;
+    }
+    return null;
+  } catch (e) {
+    console.error('Workers AI error:', e);
+    return null;
   }
 }
 

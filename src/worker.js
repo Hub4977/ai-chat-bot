@@ -10,6 +10,12 @@ export default {
 
     // ── Web API ──
     if (url.pathname.startsWith('/api/')) {
+      // 搜索 API（GET）
+      if (url.pathname === '/api/search' && request.method === 'GET') {
+        var q = url.searchParams.get('q') || '';
+        var results = await webSearch(q);
+        return new Response(JSON.stringify({ok: true, results: results}), {headers: {'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*'}});
+      }
       return handleWebAPI(url.pathname, request, env);
     }
 
@@ -671,12 +677,251 @@ async function markNvidiaUp(env) {
   await env.KV.delete('nvidia_fail');
 }
 
+// ── 联网搜索（多源策略：Bing英文+Bing中文+Wiki并行→合并去重）────
+async function webSearch(query) {
+  if (!query || query.trim().length === 0) return [];
+
+  var hasChinese = /[\u4e00-\u9fff]/.test(query);
+  var allResults = [];
+  var titles = [];
+
+  // 并行搜索
+  var searches = [
+    bingSearch(query).catch(function() { return []; }),
+    wikiSearch(query).catch(function() { return []; }),
+  ];
+
+  // 中文查询：额外发一个英文版 Bing 搜索（Bing 英文搜索质量远好于中文）
+  if (hasChinese) {
+    // 用简单的中→英关键词映射辅助搜索
+    var enQuery = chineseToEnglish(query);
+    searches.push(bingSearch(enQuery).catch(function() { return []; }));
+  }
+
+  var results = await Promise.all(searches);
+  var bingRes = results[0] || [];
+  var wikiRes = results[1] || [];
+  var bingEnRes = results[2] || [];
+
+  // 垃圾内容过滤
+  var blockedWords = ['xxx', 'porn', 'sex', 'chudai', 'bahan', 'bhai', 'fuck', 'nude', 'hentai', 'onlyfans'];
+  function isClean(item) {
+    var lower = (item.title + ' ' + item.url + ' ' + item.snippet).toLowerCase();
+    for (var j = 0; j < blockedWords.length; j++) {
+      if (lower.includes(blockedWords[j])) return false;
+    }
+    return true;
+  }
+
+  function addResult(item) {
+    var tLower = item.title.toLowerCase();
+    if (titles.includes(tLower)) return;
+    titles.push(tLower);
+    allResults.push(item);
+  }
+
+  // 中文查询：英文 Bing 优先（实时信息丰富）→ 中文 Bing → Wiki
+  // 英文查询：Bing → Wiki
+  if (hasChinese) {
+    bingEnRes.filter(isClean).forEach(addResult);
+    bingRes.filter(isClean).forEach(addResult);
+    wikiRes.forEach(addResult);
+  } else {
+    bingRes.filter(isClean).forEach(addResult);
+    wikiRes.forEach(addResult);
+  }
+
+  // DDG 兜底
+  if (allResults.length < 3) {
+    var ddgRes = await ddgInstant(query).catch(function() { return []; });
+    ddgRes.filter(isClean).forEach(addResult);
+  }
+
+  return allResults.slice(0, 8);
+}
+
+// 中文查询→英文关键词（辅助 Bing 英文搜索，效果远好于中文搜索）
+function chineseToEnglish(query) {
+  var map = [
+    ['今天', 'today'], ['新闻', 'news'], ['最新', 'latest'], ['天气', 'weather'],
+    ['搜索', 'search'], ['查找', 'find'], ['查一下', 'check'], ['帮我查', 'check'],
+    ['现在', 'now'], ['最近', 'recent'], ['当前', 'current'], ['实时', 'live realtime'],
+    ['科技', 'technology tech'], ['财经', 'finance business'], ['体育', 'sports'],
+    ['股票', 'stock market'], ['汇率', 'exchange rate currency'], ['比分', 'score result'],
+    ['北京', 'Beijing'], ['上海', 'Shanghai'], ['深圳', 'Shenzhen'], ['广州', 'Guangzhou'],
+    ['发生', 'happening'], ['最新消息', 'latest news update'], ['什么', 'what'],
+    ['怎么样', 'how about'], ['多少', 'how much how many'], ['哪里', 'where'],
+    ['为什么', 'why'], ['如何', 'how to'], ['什么时候', 'when'],
+    ['中国', 'China'], ['美国', 'USA America'], ['世界', 'world'],
+    ['人工智能', 'AI artificial intelligence'], ['AI', 'AI'],
+    ['人工智能', 'AI'], ['手机', 'phone smartphone'], ['电脑', 'computer'],
+    ['游戏', 'game gaming'], ['电影', 'movie film'], ['音乐', 'music'],
+    ['教育', 'education'], ['医疗', 'medical health'], ['军事', 'military defense'],
+    ['外交', 'diplomacy'], ['经济', 'economy'], ['政治', 'politics'],
+  ];
+  var result = query;
+  // 按词长度降序替换（避免"最新消息"被"最新"先替换）
+  map.sort(function(a, b) { return b[0].length - a[0].length; });
+  for (var i = 0; i < map.length; i++) {
+    result = result.replace(new RegExp(map[i][0], 'g'), ' ' + map[i][1] + ' ');
+  }
+  // 去掉残余中文
+  result = result.replace(/[\u4e00-\u9fff]/g, ' ').trim();
+  // 清理多余空格
+  result = result.replace(/\s+/g, ' ').trim();
+  return result.length > 2 ? result : query;
+}
+
+// Bing RSS 搜索（无需 API Key，英文效果极好，中文辅助）
+async function bingSearch(query) {
+  try {
+    var res = await fetch('https://www.bing.com/search?q=' + encodeURIComponent(query) + '&format=rss', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Bot/1.0)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    var xml = await res.text();
+    var results = [];
+    var itemRegex = /<item>(.*?)<\/item>/gs;
+    var titleRegex = /<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/title>/;
+    var linkRegex = /<link>(.*?)<\/link>/;
+    var descRegex = /<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/description>/;
+    var item;
+    while ((item = itemRegex.exec(xml)) !== null) {
+      var block = item[1];
+      var title = (titleRegex.exec(block) || [])[1];
+      var link = (linkRegex.exec(block) || [])[1];
+      var desc = (descRegex.exec(block) || [])[1];
+      if (title && title !== 'Bing: ' + query) {
+        title = title.replace(/<[^>]+>/g, '').trim();
+        desc = desc ? desc.replace(/<[^>]+>/g, '').trim() : '';
+        if (title.length > 3) {
+          results.push({ title: title, url: link || '', snippet: desc });
+        }
+      }
+      if (results.length >= 8) break;
+    }
+    return results;
+  } catch (e) {
+    console.error('Bing search error:', e);
+    return [];
+  }
+}
+
+
+
+// Wikipedia 搜索（中英文并行，query API 更完整）
+async function wikiSearch(query) {
+  try {
+    var results = [];
+    // 中文+英文 Wikipedia 并行搜索
+    var [cnRes, enRes] = await Promise.all([
+      fetch('https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch=' + encodeURIComponent(query) + '&format=json&srlimit=5', {
+        headers: { 'User-Agent': 'AIBot/1.0' },
+        signal: AbortSignal.timeout(8000),
+      }).then(function(r) { return r.json(); }).catch(function() { return null; }),
+      fetch('https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=' + encodeURIComponent(query) + '&format=json&srlimit=5', {
+        headers: { 'User-Agent': 'AIBot/1.0' },
+        signal: AbortSignal.timeout(8000),
+      }).then(function(r) { return r.json(); }).catch(function() { return null; }),
+    ]);
+    if (cnRes && cnRes.query && cnRes.query.search) {
+      for (var i = 0; i < cnRes.query.search.length; i++) {
+        var s = cnRes.query.search[i];
+        results.push({
+          title: s.title,
+          url: 'https://zh.wikipedia.org/wiki/' + encodeURIComponent(s.title),
+          snippet: s.snippet ? s.snippet.replace(/<[^>]+>/g, '').trim() : '',
+        });
+      }
+    }
+    if (enRes && enRes.query && enRes.query.search) {
+      for (var i = 0; i < enRes.query.search.length; i++) {
+        var s = enRes.query.search[i];
+        results.push({
+          title: s.title,
+          url: 'https://en.wikipedia.org/wiki/' + encodeURIComponent(s.title),
+          snippet: s.snippet ? s.snippet.replace(/<[^>]+>/g, '').trim() : '',
+        });
+      }
+    }
+    return results.slice(0, 8);
+  } catch (e) {
+    console.error('Wiki search error:', e);
+    return [];
+  }
+}
+
+// DuckDuckGo 即时回答（兜底，只有摘要）
+async function ddgInstant(query) {
+  try {
+    var res = await fetch('https://api.duckduckgo.com/?q=' + encodeURIComponent(query) + '&format=json&no_redirect=1', {
+      signal: AbortSignal.timeout(8000),
+    });
+    var data = await res.json();
+    var results = [];
+    if (data && data.Abstract && data.Abstract.length > 10) {
+      results.push({ title: data.Heading || query, url: data.AbstractURL || '', snippet: data.Abstract });
+    }
+    if (data && data.RelatedTopics) {
+      for (var i = 0; i < data.RelatedTopics.length && results.length < 5; i++) {
+        var t = data.RelatedTopics[i];
+        if (t && t.Text && t.Text.length > 10) {
+          results.push({ title: t.Text.substring(0, 60), url: t.FirstURL || '', snippet: t.Text });
+        }
+      }
+    }
+    return results;
+  } catch (e) {
+    return [];
+  }
+}
+
+// 提取搜索结果文本供 AI 参考
+async function searchForAI(query) {
+  var results = await webSearch(query);
+  if (results.length === 0) return '';
+  var text = '【联网搜索结果】\n';
+  for (var i = 0; i < results.length; i++) {
+    text += (i+1) + '. ' + results[i].title;
+    if (results[i].snippet) text += ' — ' + results[i].snippet;
+    text += '\n';
+  }
+  text += '\n请基于以上搜索结果，结合你的知识，用中文回答用户的问题。如果搜索结果不够充分，请说明。';
+  return text;
+}
+
+// 判断用户消息是否需要联网搜索
+function needsSearch(text) {
+  var lower = text.toLowerCase();
+  var keywords = ['最新', '新闻', '今天', '现在', '最近', '当前', '实时', '最新消息', '发生', '搜', '搜索', '查', '查一下', '帮我查', '天气', '汇率', '股价', '比分', 'latest', 'news', 'today', 'now', 'current', 'recent', 'search', 'what is', 'who is', 'when is'];
+  for (var i = 0; i < keywords.length; i++) {
+    if (lower.includes(keywords[i])) return true;
+  }
+  // 问号结尾的问题也可能需要
+  if (/[？?]$/.test(text.trim())) return true;
+  return false;
+}
+
 // 主调用函数：NVIDIA → Workers AI 保守降级
 async function callAI(env, modelId, messages) {
   var bjNow = new Date(Date.now() + 8 * 3600000);
   var bjTime = bjNow.getUTCFullYear() + '-' + String(bjNow.getUTCMonth()+1).padStart(2,'0') + '-' + String(bjNow.getUTCDate()).padStart(2,'0') + ' ' + String(bjNow.getUTCHours()).padStart(2,'0') + ':' + String(bjNow.getUTCMinutes()).padStart(2,'0');
-  var sysPrompt = '你是一个有用的AI助手。请用中文回复。重要规则：1.当前北京时间是' + bjTime + '，你必须以这个时间为当前真实时间来回答任何时间相关问题，不要说你不知道当前时间。2.当用户问及新闻、事件、资讯时，请基于你已知的最新的信息回答，并说明信息的时间范围。3.不要提及你的知识截止日期或训练数据限制，直接以当前时间视角回答。';
+  var sysPrompt = '你是一个有用的AI助手，具备联网搜索能力。请用中文回复。重要规则：1.当前北京时间是' + bjTime + '，你必须以这个时间为当前真实时间来回答任何时间相关问题。2.当提供给你【联网搜索结果】时，请优先基于搜索结果回答，并说明信息来源。3.不要提及你的知识截止日期或训练数据限制，直接以当前时间视角回答。4.如果搜索结果与你的知识有冲突，优先采用搜索结果的最新信息。';
   var allMessages = [{ role: 'system', content: sysPrompt }];
+
+  // 如果最后一条用户消息需要联网，先搜索
+  var lastUserMsg = '';
+  for (var i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') { lastUserMsg = messages[i].content; break; }
+  }
+  if (lastUserMsg && needsSearch(lastUserMsg)) {
+    var searchContext = await searchForAI(lastUserMsg);
+    if (searchContext) {
+      // 在用户消息前插入搜索结果作为上下文
+      allMessages.push({ role: 'system', content: searchContext });
+    }
+  }
+
   for (var i = 0; i < messages.length; i++) allMessages.push(messages[i]);
 
   // NVIDIA 还没降级，优先用

@@ -1,0 +1,9 @@
+name = "ai-chat-bot"
+main = "src/worker.js"
+compatibility_date = "2024-12-01"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "dc52b4f0cd004489a74648865e105242"
+
+
